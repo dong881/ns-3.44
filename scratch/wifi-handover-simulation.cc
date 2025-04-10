@@ -9,6 +9,7 @@
 #include <fstream>
 #include <string>
 #include <map>
+#include <vector>
 
 using namespace ns3;
 
@@ -58,123 +59,152 @@ ThroughputSink::SetLastTotalRx(uint64_t lastTotalRx)
   m_lastTotalRx = lastTotalRx;
 }
 
-// User migration handler class
-class UserMigrationHandler {
+// Improved centralized handover controller
+class HandoverController {
 public:
-    UserMigrationHandler(Ptr<Node> apA, Ptr<Node> apB, NodeContainer& staNodes, NetDeviceContainer& staDevices) 
-    : m_apA(apA), m_apB(apB), m_staNodes(staNodes), m_staDevices(staDevices) {
-        // Map stations to their initial AP
+    // Handover plan structure
+    struct HandoverPlan {
+        double time;           // When to execute handover
+        uint32_t moveFromAToB; // Number of users to move from A to B
+        uint32_t moveFromBToA; // Number of users to move from B to A
+    };
+
+    HandoverController(NodeContainer apNodes, NodeContainer staNodes, NetDeviceContainer staDevices) 
+        : m_apNodes(apNodes), m_staNodes(staNodes), m_staDevices(staDevices) {
+        
+        // Initialize AP-STA associations (first 16 to AP A, rest to AP B)
         for (uint32_t i = 0; i < staNodes.GetN(); i++) {
             if (i < 16) {
-                m_staToAp[i] = 0; // First 16 stations to AP A
+                m_staToAp[i] = 0; // Associated with AP A
             } else {
-                m_staToAp[i] = 1; // Next 16 stations to AP B
+                m_staToAp[i] = 1; // Associated with AP B
             }
         }
         
-        // Get AP MAC addresses
-        Ptr<WifiNetDevice> apDevA = DynamicCast<WifiNetDevice>(m_apA->GetDevice(0));
-        Ptr<WifiNetDevice> apDevB = DynamicCast<WifiNetDevice>(m_apB->GetDevice(0));
-        
-        if (apDevA && apDevB) {
-            m_apAMac = Mac48Address::ConvertFrom(apDevA->GetAddress());
-            m_apBMac = Mac48Address::ConvertFrom(apDevB->GetAddress());
+        // Get MAC addresses for all APs
+        for (uint32_t i = 0; i < m_apNodes.GetN(); i++) {
+            Ptr<WifiNetDevice> apDev = DynamicCast<WifiNetDevice>(m_apNodes.Get(i)->GetDevice(0));
+            if (apDev) {
+                m_apMacs.push_back(Mac48Address::ConvertFrom(apDev->GetAddress()));
+                NS_LOG_INFO("AP " << i << " MAC address: " << m_apMacs[i]);
+            }
         }
     }
     
-    void ScheduleMigration(double timeInSeconds, double percentAtoB, double percentBtoA) {
-        Simulator::Schedule(Seconds(timeInSeconds), &UserMigrationHandler::MigrateUsers, this, percentAtoB, percentBtoA);
+    // Add a handover plan to the schedule
+    void AddHandoverPlan(double time, uint32_t moveFromAToB, uint32_t moveFromBToA) {
+        HandoverPlan plan;
+        plan.time = time;
+        plan.moveFromAToB = moveFromAToB;
+        plan.moveFromBToA = moveFromBToA;
+        
+        m_handoverPlans.push_back(plan);
+        
+        // Schedule this handover
+        Simulator::Schedule(Seconds(time), &HandoverController::ExecuteHandover, this, moveFromAToB, moveFromBToA);
+        
+        NS_LOG_INFO("Scheduled handover at " << time << "s: " << moveFromAToB << " users A->B, " 
+                    << moveFromBToA << " users B->A");
     }
     
-    void PrintUserDistribution(std::ostream& os) {
+    // Get the current distribution of users
+    std::pair<uint32_t, uint32_t> GetUserDistribution() const {
         uint32_t countA = 0;
         uint32_t countB = 0;
         
         for (auto const& pair : m_staToAp) {
             if (pair.second == 0) countA++;
-            else countB++;
+            else if (pair.second == 1) countB++;
         }
         
+        return std::make_pair(countA, countB);
+    }
+    
+    // Log the user distribution to file
+    void LogUserDistribution(std::ofstream& os) {
+        auto distribution = GetUserDistribution();
         double time = Simulator::Now().GetSeconds();
-        os << time << "," << countA << "," << countB << std::endl;
         
-        NS_LOG_UNCOND("Time " << time << "s: " << countA << " users at AP A, " << countB << " users at AP B");
+        os << time << "," << distribution.first << "," << distribution.second << std::endl;
+        
+        NS_LOG_INFO("Time " << time << "s: " << distribution.first << " users at AP A, " 
+                   << distribution.second << " users at AP B");
     }
 
 private:
-    void MigrateUsers(double percentAtoB, double percentBtoA) {
-        NS_LOG_UNCOND("Migrating users: " << percentAtoB*100 << "% from A->B, " << percentBtoA*100 << "% from B->A");
+    void ExecuteHandover(uint32_t moveFromAToB, uint32_t moveFromBToA) {
+        NS_LOG_INFO("Executing handover: " << moveFromAToB << " users A->B, " << moveFromBToA << " users B->A");
         
-        // Count users at each AP
+        // Get current lists of users at each AP
         std::vector<uint32_t> usersAtA;
         std::vector<uint32_t> usersAtB;
         
         for (auto const& pair : m_staToAp) {
-            if (pair.second == 0) usersAtA.push_back(pair.first);
-            else usersAtB.push_back(pair.first);
+            if (pair.second == 0) {
+                usersAtA.push_back(pair.first);
+            } else if (pair.second == 1) {
+                usersAtB.push_back(pair.first);
+            }
         }
         
-        // Calculate number of users to move
-        uint32_t moveAtoB = static_cast<uint32_t>(usersAtA.size() * percentAtoB);
-        uint32_t moveBtoA = static_cast<uint32_t>(usersAtB.size() * percentBtoA);
+        // Check if we have enough users to move
+        moveFromAToB = std::min(moveFromAToB, static_cast<uint32_t>(usersAtA.size()));
+        moveFromBToA = std::min(moveFromBToA, static_cast<uint32_t>(usersAtB.size()));
         
-        NS_LOG_UNCOND("Moving " << moveAtoB << " users from A->B and " << moveBtoA << " users from B->A");
-        
-        // Move users from A to B
-        for (uint32_t i = 0; i < moveAtoB && i < usersAtA.size(); i++) {
+        // Execute A to B handover
+        for (uint32_t i = 0; i < moveFromAToB; i++) {
             uint32_t staIndex = usersAtA[i];
             Ptr<WifiNetDevice> staDev = DynamicCast<WifiNetDevice>(m_staDevices.Get(staIndex));
             
-            if (staDev) {
-                staDev->GetMac()->SetBssid(m_apBMac, 0); // Added linkId=0
-                m_staToAp[staIndex] = 1; // Now associated with AP B
-                NS_LOG_UNCOND("Station " << staIndex << " moved from AP A to AP B");
+            if (staDev && staDev->GetMac()) {
+                staDev->GetMac()->SetBssid(m_apMacs[1], 0); // Move to AP B (index 1)
+                m_staToAp[staIndex] = 1;
+                NS_LOG_INFO("Station " << staIndex << " moved from AP A to AP B");
             }
         }
         
-        // Move users from B to A
-        for (uint32_t i = 0; i < moveBtoA && i < usersAtB.size(); i++) {
+        // Execute B to A handover
+        for (uint32_t i = 0; i < moveFromBToA; i++) {
             uint32_t staIndex = usersAtB[i];
             Ptr<WifiNetDevice> staDev = DynamicCast<WifiNetDevice>(m_staDevices.Get(staIndex));
             
-            if (staDev) {
-                staDev->GetMac()->SetBssid(m_apAMac, 0); // Added linkId=0
-                m_staToAp[staIndex] = 0; // Now associated with AP A
-                NS_LOG_UNCOND("Station " << staIndex << " moved from AP B to AP A");
+            if (staDev && staDev->GetMac()) {
+                staDev->GetMac()->SetBssid(m_apMacs[0], 0); // Move to AP A (index 0)
+                m_staToAp[staIndex] = 0;
+                NS_LOG_INFO("Station " << staIndex << " moved from AP B to AP A");
             }
         }
         
-        // Record current distribution to file
+        // Log user distribution after handover
         std::ofstream userDist("user_distribution.csv", std::ios_base::app);
-        PrintUserDistribution(userDist);
+        LogUserDistribution(userDist);
     }
-    
-    Ptr<Node> m_apA;
-    Ptr<Node> m_apB;
-    NodeContainer& m_staNodes;
-    NetDeviceContainer& m_staDevices;
-    std::map<uint32_t, int> m_staToAp; // Maps station index to AP (0=A, 1=B)
-    Mac48Address m_apAMac;
-    Mac48Address m_apBMac;
+
+    NodeContainer m_apNodes;
+    NodeContainer m_staNodes;
+    NetDeviceContainer m_staDevices;
+    std::map<uint32_t, int> m_staToAp;      // Maps station index to AP index
+    std::vector<Mac48Address> m_apMacs;      // MAC addresses of APs
+    std::vector<HandoverPlan> m_handoverPlans; // List of handover plans
 };
 
-// Monitor throughput function using our custom ThroughputSink
-void MonitorThroughput(Ptr<ThroughputSink> sinkA, Ptr<ThroughputSink> sinkB, std::ofstream& os, double interval) {
+// Generic function to monitor throughput of any AP
+void MonitorApThroughput(std::vector<Ptr<ThroughputSink>> sinks, std::ofstream& os, double interval) {
     double timeNow = Simulator::Now().GetSeconds();
     
-    // Calculate throughput in Mbps
-    double throughputA = (sinkA->GetTotalRx() - sinkA->GetLastTotalRx()) * 8.0 / interval / 1000000;
-    double throughputB = (sinkB->GetTotalRx() - sinkB->GetLastTotalRx()) * 8.0 / interval / 1000000;
+    // Write time
+    os << timeNow;
     
-    // Save current received bytes for next calculation
-    sinkA->SetLastTotalRx(sinkA->GetTotalRx());
-    sinkB->SetLastTotalRx(sinkB->GetTotalRx());
-    
-    // Write to file
-    os << timeNow << "," << throughputA << "," << throughputB << std::endl;
+    // Calculate and record throughput for each AP
+    for (uint32_t i = 0; i < sinks.size(); i++) {
+        double throughput = (sinks[i]->GetTotalRx() - sinks[i]->GetLastTotalRx()) * 8.0 / interval / 1000000;
+        sinks[i]->SetLastTotalRx(sinks[i]->GetTotalRx());
+        os << "," << throughput;
+    }
+    os << std::endl;
     
     // Schedule next call
-    Simulator::Schedule(Seconds(interval), &MonitorThroughput, sinkA, sinkB, std::ref(os), interval);
+    Simulator::Schedule(Seconds(interval), &MonitorApThroughput, sinks, std::ref(os), interval);
 }
 
 int main(int argc, char *argv[]) {
@@ -185,6 +215,10 @@ int main(int argc, char *argv[]) {
     double simTime = 3.0;         // Total simulation time (5 minutes)
     double firstMigration = 1.0;  // First migration time (at 100 seconds)
     double secondMigration = 2.0; // Second migration time (at 200 seconds)
+    uint32_t firstMoveAtoB = 4;     // Number of users to move A->B in first migration (25% of 16)
+    uint32_t firstMoveBtoA = 8;     // Number of users to move B->A in first migration (50% of 16)
+    uint32_t secondMoveAtoB = 10;    // Number of users to move A->B in second migration (50% of 20)
+    uint32_t secondMoveBtoA = 6;    // Number of users to move B->A in second migration (50% of 12)
     double throughputInterval = 1.0; // Interval for throughput measurement
     
     // Command line arguments
@@ -192,21 +226,28 @@ int main(int argc, char *argv[]) {
     cmd.AddValue("simTime", "Total simulation time in seconds", simTime);
     cmd.AddValue("firstMigration", "Time of first user migration in seconds", firstMigration);
     cmd.AddValue("secondMigration", "Time of second user migration in seconds", secondMigration);
+    cmd.AddValue("firstMoveAtoB", "Users to move A->B in first migration", firstMoveAtoB);
+    cmd.AddValue("firstMoveBtoA", "Users to move B->A in first migration", firstMoveBtoA);
+    cmd.AddValue("secondMoveAtoB", "Users to move A->B in second migration", secondMoveAtoB);
+    cmd.AddValue("secondMoveBtoA", "Users to move B->A in second migration", secondMoveBtoA);
     cmd.Parse(argc, argv);
     
     // Print simulation parameters
     NS_LOG_INFO("Simulation parameters:");
     NS_LOG_INFO("- Total simulation time: " << simTime << " seconds");
-    NS_LOG_INFO("- First migration time: " << firstMigration << " seconds");
-    NS_LOG_INFO("- Second migration time: " << secondMigration << " seconds");
+    NS_LOG_INFO("- First migration at " << firstMigration << "s: " 
+                << firstMoveAtoB << " users A->B, " << firstMoveBtoA << " users B->A");
+    NS_LOG_INFO("- Second migration at " << secondMigration << "s: " 
+                << secondMoveAtoB << " users A->B, " << secondMoveBtoA << " users B->A");
     
+    uint32_t nAps = 2;
     uint32_t totalStations = 32;  // 16 stations per AP
     
-    NS_LOG_INFO("Creating topology");
+    NS_LOG_INFO("Creating topology with " << nAps << " APs and " << totalStations << " stations");
     
-    // Create nodes: 2 APs and 32 stations (16 per AP)
+    // Create nodes: 2 APs and 32 stations (16 per AP initially)
     NodeContainer apNodes;
-    apNodes.Create(2);
+    apNodes.Create(nAps);
     
     NodeContainer staNodes;
     staNodes.Create(totalStations);
@@ -224,7 +265,7 @@ int main(int argc, char *argv[]) {
     WifiMacHelper mac;
     Ssid ssid = Ssid("wifi-handover-network");
     
-    // AP configuration
+    // AP configuration - all APs use the same code/configuration
     mac.SetType("ns3::ApWifiMac",
                "Ssid", SsidValue(ssid),
                "BeaconGeneration", BooleanValue(true),
@@ -233,7 +274,7 @@ int main(int argc, char *argv[]) {
     // Install on AP nodes
     NetDeviceContainer apDevices = wifi.Install(phy, mac, apNodes);
     
-    // STA configuration
+    // STA configuration - all stations use the same code/configuration
     mac.SetType("ns3::StaWifiMac",
                "Ssid", SsidValue(ssid),
                "ActiveProbing", BooleanValue(false));
@@ -246,8 +287,10 @@ int main(int argc, char *argv[]) {
     
     // Position APs
     Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-    positionAlloc->Add(Vector(0.0, 0.0, 0.0));  // AP A position
-    positionAlloc->Add(Vector(50.0, 0.0, 0.0)); // AP B position
+    for (uint32_t i = 0; i < nAps; i++) {
+        // Position APs at different locations (50 units apart)
+        positionAlloc->Add(Vector(i * 50.0, 0.0, 0.0));
+    }
     
     mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
@@ -255,7 +298,7 @@ int main(int argc, char *argv[]) {
     
     // Random walk for stations
     mobility.SetPositionAllocator("ns3::RandomDiscPositionAllocator",
-                                 "X", DoubleValue(25.0),
+                                 "X", DoubleValue(25.0), // Centered between the APs
                                  "Y", DoubleValue(0.0),
                                  "Rho", StringValue("ns3::UniformRandomVariable[Min=0|Max=30]"));
     
@@ -279,26 +322,22 @@ int main(int argc, char *argv[]) {
     // Setup servers on APs
     uint16_t port = 9;
     
-    // Create packet sinks on APs using our custom sink
-    ObjectFactory factory;
-    factory.SetTypeId("ns3::ThroughputSink");
-    factory.Set("Protocol", StringValue("ns3::UdpSocketFactory"));
-    factory.Set("Local", AddressValue(InetSocketAddress(Ipv4Address::GetAny(), port)));
+    // Create packet sinks on all APs using our custom sink
+    std::vector<Ptr<ThroughputSink>> sinks;
+    
+    for (uint32_t i = 0; i < nAps; i++) {
+        ObjectFactory factory;
+        factory.SetTypeId("ns3::ThroughputSink");
+        factory.Set("Protocol", StringValue("ns3::UdpSocketFactory"));
+        factory.Set("Local", AddressValue(InetSocketAddress(Ipv4Address::GetAny(), port)));
 
-    Ptr<ThroughputSink> sinkA = DynamicCast<ThroughputSink>(factory.Create<ThroughputSink>());
-    Ptr<ThroughputSink> sinkB = DynamicCast<ThroughputSink>(factory.Create<ThroughputSink>());
-    
-    apNodes.Get(0)->AddApplication(sinkA);
-    apNodes.Get(1)->AddApplication(sinkB);
-    
-    sinkA->SetStartTime(Seconds(0.0));
-    sinkA->SetStopTime(Seconds(simTime));
-    sinkB->SetStartTime(Seconds(0.0));
-    sinkB->SetStopTime(Seconds(simTime));
-    
-    // Initialize the counters
-    sinkA->SetLastTotalRx(0);
-    sinkB->SetLastTotalRx(0);
+        Ptr<ThroughputSink> sink = DynamicCast<ThroughputSink>(factory.Create<ThroughputSink>());
+        apNodes.Get(i)->AddApplication(sink);
+        sink->SetStartTime(Seconds(0.0));
+        sink->SetStopTime(Seconds(simTime));
+        sink->SetLastTotalRx(0);
+        sinks.push_back(sink);
+    }
     
     // Full queue traffic generation (OnOff Application)
     OnOffHelper onoff("ns3::UdpSocketFactory", Address());
@@ -327,8 +366,8 @@ int main(int argc, char *argv[]) {
     clientApps.Start(Seconds(1.0));
     clientApps.Stop(Seconds(simTime - 1));
     
-    // Create user migration handler
-    UserMigrationHandler migrationHandler(apNodes.Get(0), apNodes.Get(1), staNodes, staDevices);
+    // Create handover controller
+    HandoverController handoverController(apNodes, staNodes, staDevices);
     
     // Initialize output files
     std::ofstream throughputFile("throughput.csv");
@@ -338,13 +377,12 @@ int main(int argc, char *argv[]) {
     userDistFile << "Time,UsersAtA,UsersAtB" << std::endl;
     userDistFile << "0,16,16" << std::endl;
     
-    // Schedule user migrations using the configurable parameters
-    migrationHandler.ScheduleMigration(firstMigration, 0.25, 0.50);  // 1st migration: 25% A→B, 50% B→A
-    migrationHandler.ScheduleMigration(secondMigration, 0.50, 0.50); // 2nd migration: 50% A→B, 50% B→A
+    // Schedule handovers with specific numbers of users to move
+    handoverController.AddHandoverPlan(firstMigration, firstMoveAtoB, firstMoveBtoA);
+    handoverController.AddHandoverPlan(secondMigration, secondMoveAtoB, secondMoveBtoA);
     
     // Schedule throughput monitoring
-    Simulator::Schedule(Seconds(1.0), &MonitorThroughput, 
-                      sinkA, sinkB, std::ref(throughputFile), throughputInterval);
+    Simulator::Schedule(Seconds(1.0), &MonitorApThroughput, sinks, std::ref(throughputFile), throughputInterval);
     
     // Run simulation
     NS_LOG_INFO("Starting simulation for " << simTime << " seconds");
@@ -353,8 +391,9 @@ int main(int argc, char *argv[]) {
     
     // Print final statistics
     NS_LOG_INFO("Simulation complete");
-    NS_LOG_INFO("Total bytes received at AP A: " << sinkA->GetTotalRx());
-    NS_LOG_INFO("Total bytes received at AP B: " << sinkB->GetTotalRx());
+    for (uint32_t i = 0; i < nAps; i++) {
+        NS_LOG_INFO("Total bytes received at AP " << i << ": " << sinks[i]->GetTotalRx());
+    }
     
     Simulator::Destroy();
     return 0;
