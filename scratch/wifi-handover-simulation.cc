@@ -205,9 +205,10 @@ int main(int argc, char *argv[]) {
     LogComponentEnable("WifiHandoverSimulation", LOG_LEVEL_INFO);
 
     // Configurable simulation parameters
-    double simTime = 3.0;
-    double firstMigration = 1.0;
-    double secondMigration = 2.0;
+    int ratio = 60;
+    double simTime = 3.0 * ratio;
+    double firstMigration = 1.0 * ratio;
+    double secondMigration = 2.0 * ratio;
     uint32_t firstMoveAtoB = 4;
     uint32_t firstMoveBtoA = 8;
     uint32_t secondMoveAtoB = 10;
