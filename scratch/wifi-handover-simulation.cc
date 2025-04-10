@@ -1,348 +1,256 @@
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
-#include "ns3/mobility-module.h"
 #include "ns3/wifi-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/flow-monitor-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/applications-module.h"
-#include "ns3/flow-monitor-module.h"
-#include "ns3/netanim-module.h"
-#include <fstream>
-#include <vector>
-#include <iomanip>
+#include "ns3/ipv4-flow-classifier.h"
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("WifiHandoverSimulation");
+NS_LOG_COMPONENT_DEFINE("WifiFullQueueSimulation");
 
-// Global variables for statistics
-std::map<uint32_t, std::pair<double, uint32_t>> apAStats;  // throughput, connected users
-std::map<uint32_t, std::pair<double, uint32_t>> apBStats;
+// 自訂移動事件處理類別
+class UserMigrationHandler {
+public:
+    UserMigrationHandler(
+        NodeContainer& apNodes,
+        NodeContainer& staNodes,
+        NetDeviceContainer& apDevices,
+        NetDeviceContainer& staDevices,
+        uint32_t nStaPerAp)
+        : m_apNodes(apNodes),
+          m_staNodes(staNodes),
+          m_apDevices(apDevices),
+          m_staDevices(staDevices),
+          nStaPerAp(nStaPerAp) {}
 
-void MoveNode(Ptr<Node> node, const Vector& targetPosition) {
-    Ptr<ConstantVelocityMobilityModel> mobility = 
-        node->GetObject<ConstantVelocityMobilityModel>();
-    
-    // Get current position
-    Vector currentPos = mobility->GetPosition();
-    
-    // Calculate direction vector
-    Vector direction(targetPosition.x - currentPos.x,
-                    targetPosition.y - currentPos.y,
-                    0);
-    
-    // Normalize and set velocity
-    double distance = std::sqrt(std::pow(direction.x, 2) + std::pow(direction.y, 2));
-    if (distance > 0) {
-        mobility->SetVelocity(Vector(direction.x / distance * 5.0,
-                                   direction.y / distance * 5.0,
-                                   0));
+    void MigrateUsers(double time, double percentAtoB, double percentBtoA) {
+        Simulator::Schedule(Seconds(time), &UserMigrationHandler::DoMigrate, this, percentAtoB, percentBtoA);
     }
-}
 
-void
-UpdateUserCounts(NodeContainer& nodesA, NodeContainer& nodesB, 
-                Ptr<Node> apA, Ptr<Node> apB, uint32_t timeStep)
-{
-    uint32_t usersA = 0;
-    uint32_t usersB = 0;
-    
-    // Count users based on distance to APs
-    for (uint32_t i = 0; i < nodesA.GetN(); ++i) {
-        Ptr<MobilityModel> mobModel = nodesA.Get(i)->GetObject<MobilityModel>();
-        Vector pos = mobModel->GetPosition();
+private:
+    void DoMigrate(double percentAtoB, double percentBtoA) {
+        // 獲取當前時間戳記
+        double currentTime = Simulator::Now().GetSeconds();
         
-        double distToA = std::sqrt(std::pow(pos.x + 50, 2) + std::pow(pos.y, 2));
-        double distToB = std::sqrt(std::pow(pos.x - 50, 2) + std::pow(pos.y, 2));
-        
-        if (distToA < distToB) usersA++;
-        else usersB++;
-    }
-    
-    for (uint32_t i = 0; i < nodesB.GetN(); ++i) {
-        Ptr<MobilityModel> mobModel = nodesB.Get(i)->GetObject<MobilityModel>();
-        Vector pos = mobModel->GetPosition();
-        
-        double distToA = std::sqrt(std::pow(pos.x + 50, 2) + std::pow(pos.y, 2));
-        double distToB = std::sqrt(std::pow(pos.x - 50, 2) + std::pow(pos.y, 2));
-        
-        if (distToA < distToB) usersA++;
-        else usersB++;
-    }
-    
-    // Update statistics
-    if (apAStats.find(timeStep) != apAStats.end()) {
-        apAStats[timeStep].second = usersA;
-    }
-    if (apBStats.find(timeStep) != apBStats.end()) {
-        apBStats[timeStep].second = usersB;
-    }
-    
-    // Log user distribution
-    std::ofstream outFile("/home/ming/multimedia-wireless-networks/a2/src/user_distribution.csv", std::ios::app);
-    outFile << timeStep << "," << usersA << "," << usersB << std::endl;
-    outFile.close();
-}
+        // 記錄日誌
+        NS_LOG_INFO("Executing user migration at " << currentTime << "s");
 
-void
-ThroughputMonitor(FlowMonitorHelper* fmhelper, Ptr<FlowMonitor> flowMon, 
-                  NodeContainer& nodesA, NodeContainer& nodesB,
-                  Ptr<Node> apA, Ptr<Node> apB, double em)
-{
-    std::map<FlowId, FlowMonitor::FlowStats> flowStats = flowMon->GetFlowStats();
-    double throughputA = 0.0;
-    double throughputB = 0.0;
-    uint32_t timeStep = static_cast<uint32_t>(em);
-    
-    for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator i = flowStats.begin(); i != flowStats.end(); ++i) {
-        double localThroughput = i->second.rxBytes * 8.0 / (i->second.timeLastRxPacket.GetSeconds() - i->second.timeFirstTxPacket.GetSeconds()) / 1024 / 1024;
+        // 轉換 AP 地址為 Mac48Address 類型
+        Mac48Address ap1Addr = Mac48Address::ConvertFrom(m_apDevices.Get(0)->GetAddress());
+        Mac48Address ap2Addr = Mac48Address::ConvertFrom(m_apDevices.Get(1)->GetAddress());
+
+        // 計算遷移數量
+        uint32_t moveAtoB = static_cast<uint32_t>(nStaPerAp * percentAtoB);
+        uint32_t moveBtoA = static_cast<uint32_t>(nStaPerAp * percentBtoA);
         
-        Ipv4FlowClassifier::FiveTuple t = StaticCast<Ipv4FlowClassifier>(fmhelper->GetClassifier())->FindFlow(i->first);
-        if (t.destinationAddress == "10.1.1.1") { // AP A
-            throughputA += localThroughput;
-        } else if (t.destinationAddress == "10.1.2.1") { // AP B
-            throughputB += localThroughput;
+        NS_LOG_INFO("Moving " << moveAtoB << " stations from AP1 to AP2");
+        NS_LOG_INFO("Moving " << moveBtoA << " stations from AP2 to AP1");
+
+        // 執行遷移邏輯（假設使用單一鏈路，linkId=0）
+        for (uint32_t i = 0; i < moveAtoB; ++i) {
+            Ptr<WifiNetDevice> staDev = DynamicCast<WifiNetDevice>(m_staDevices.Get(i));
+            if (!staDev) {
+                NS_LOG_ERROR("Failed to cast device " << i << " to WifiNetDevice");
+                continue;
+            }
+            
+            Ptr<WifiMac> mac = staDev->GetMac();
+            if (!mac) {
+                NS_LOG_ERROR("Failed to get MAC for device " << i);
+                continue;
+            }
+            
+            mac->SetBssid(ap2Addr, 0);
         }
+
+        for (uint32_t j = nStaPerAp; j < nStaPerAp + moveBtoA; ++j) {
+            if (j >= m_staDevices.GetN()) {
+                NS_LOG_ERROR("Device index " << j << " out of bounds");
+                continue;
+            }
+            
+            Ptr<WifiNetDevice> staDev = DynamicCast<WifiNetDevice>(m_staDevices.Get(j));
+            if (!staDev) {
+                NS_LOG_ERROR("Failed to cast device " << j << " to WifiNetDevice");
+                continue;
+            }
+            
+            Ptr<WifiMac> mac = staDev->GetMac();
+            if (!mac) {
+                NS_LOG_ERROR("Failed to get MAC for device " << j);
+                continue;
+            }
+            
+            mac->SetBssid(ap1Addr, 0);
+        }
+
+        // 記錄用戶分佈
+        std::ofstream userFile("user_distribution.csv", std::ios_base::app);
+        uint32_t countA = 0, countB = 0;
+        for (uint32_t k = 0; k < m_staNodes.GetN(); ++k) {
+            Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(m_staDevices.Get(k));
+            if (!dev || !dev->GetMac()) {
+                NS_LOG_ERROR("Invalid device or MAC at index " << k);
+                continue;
+            }
+            
+            if (dev->GetMac()->GetBssid(0) == ap1Addr) countA++;
+            else countB++;
+        }
+        userFile << currentTime << "," << countA << "," << countB << "\n";
+        NS_LOG_INFO("User distribution: AP1=" << countA << ", AP2=" << countB);
     }
+
+    NodeContainer& m_apNodes;
+    NodeContainer& m_staNodes;
+    NetDeviceContainer& m_apDevices;
+    NetDeviceContainer& m_staDevices;
+    uint32_t nStaPerAp;
+};
+
+// 簡化的吞吐量監控函數
+void ThroughputMonitor(Ptr<FlowMonitor> monitor, std::ofstream& outFile) {
+    double totalTime = Simulator::Now().GetSeconds();
+    if (totalTime == 0.0) {
+        // 避免除以零錯誤
+        Simulator::Schedule(Seconds(0.5), &ThroughputMonitor, monitor, std::ref(outFile));
+        return;
+    }
+
+    // 獲取流量統計
+    double throughputTotal = 0;
+    FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
     
-    // Store statistics
-    apAStats[timeStep] = std::make_pair(throughputA, 0);
-    apBStats[timeStep] = std::make_pair(throughputB, 0);
-    
-    // Update user counts
-    UpdateUserCounts(nodesA, nodesB, apA, apB, timeStep);
-    
-    // Log detailed statistics
-    std::ofstream outFile("/home/ming/multimedia-wireless-networks/a2/src/detailed_stats.csv", std::ios::app);
-    outFile << std::fixed << std::setprecision(6)
-            << timeStep << ","
-            << throughputA << ","
-            << throughputB << ","
-            << apAStats[timeStep].second << ","
-            << apBStats[timeStep].second << std::endl;
-    outFile.close();
-    
-    Simulator::Schedule(Seconds(1.0), &ThroughputMonitor, fmhelper, flowMon, 
-                       std::ref(nodesA), std::ref(nodesB), apA, apB, em + 1);
+    // 計算總吞吐量
+    for (auto& stat : stats) {
+        throughputTotal += stat.second.rxBytes * 8.0 / (totalTime * 1000000); // Convert to Mbps
+    }
+
+    // 寫入檔案
+    outFile << totalTime << "," << throughputTotal << "\n";
+
+    // 每0.5秒記錄一次
+    Simulator::Schedule(Seconds(0.5), &ThroughputMonitor, monitor, std::ref(outFile));
 }
 
-int main(int argc, char* argv[])
-{
-    // Enable logging
-    LogComponentEnable("WifiHandoverSimulation", LOG_LEVEL_INFO);
+int main(int argc, char *argv[]) {
+    // Enable logging for debugging
+    LogComponentEnable("WifiFullQueueSimulation", LOG_LEVEL_INFO);
     
-    // Clean previous statistics files
-    std::ofstream cleanFile1("/home/ming/multimedia-wireless-networks/a2/src/detailed_stats.csv");
-    cleanFile1 << "Time,ThroughputA,ThroughputB,UsersA,UsersB" << std::endl;
-    cleanFile1.close();
-    
-    std::ofstream cleanFile2("/home/ming/multimedia-wireless-networks/a2/src/user_distribution.csv");
-    cleanFile2 << "Time,UsersA,UsersB" << std::endl;
-    cleanFile2.close();
-    
-    // Create node containers
-    NodeContainer wifiStaNodesA;
-    wifiStaNodesA.Create(16);
-    NodeContainer wifiStaNodesB;
-    wifiStaNodesB.Create(16);
-    NodeContainer wifiApNodes;
-    wifiApNodes.Create(2);
-    
-    // Create wifi helper with improved settings
+    // 基礎參數設定
+    uint32_t nAp = 2;
+    uint32_t nStaPerAp = 16;
+    double totalTime = 15.0; // 總模擬時間為 15 秒
+
+    // 建立節點
+    NodeContainer apNodes;
+    apNodes.Create(nAp);
+
+    NodeContainer staNodes;
+    staNodes.Create(nAp * nStaPerAp);
+
+    // WiFi 設定
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211n);
-    wifi.SetRemoteStationManager("ns3::IdealWifiManager");
-    
-    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
+
     YansWifiPhyHelper phy;
-    phy.SetChannel(channel.Create());
-    
+    phy.Set("ChannelSettings", StringValue("{0, 40, BAND_5GHZ, 0}"));
+
     WifiMacHelper mac;
-    Ssid ssid1 = Ssid("AP-A");
-    Ssid ssid2 = Ssid("AP-B");
+    Ssid ssid = Ssid("ns3-wifi-network");
+
+    // 設定AP
+    mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
+    NetDeviceContainer apDevices = wifi.Install(phy, mac, apNodes);
+
+    // 設定STA
+    mac.SetType("ns3::StaWifiMac", 
+               "Ssid", SsidValue(ssid),
+               "ActiveProbing", BooleanValue(false));
+    NetDeviceContainer staDevices = wifi.Install(phy, mac, staNodes);
     
-    // Configure APs with enhanced settings
-    mac.SetType("ns3::ApWifiMac",
-                "Ssid", SsidValue(ssid1),
-                "EnableBeaconJitter", BooleanValue(false),
-                "BeaconInterval", TimeValue(MicroSeconds(102400)));
-    NetDeviceContainer apDevicesA = wifi.Install(phy, mac, wifiApNodes.Get(0));
+    // Verify the devices were created properly
+    NS_LOG_INFO("Created " << apDevices.GetN() << " AP devices");
+    NS_LOG_INFO("Created " << staDevices.GetN() << " STA devices");
     
-    mac.SetType("ns3::ApWifiMac",
-                "Ssid", SsidValue(ssid2),
-                "EnableBeaconJitter", BooleanValue(false),
-                "BeaconInterval", TimeValue(MicroSeconds(102400)));
-    NetDeviceContainer apDevicesB = wifi.Install(phy, mac, wifiApNodes.Get(1));
+    for (uint32_t i = 0; i < apDevices.GetN(); i++) {
+        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(apDevices.Get(i));
+        if (!dev || !dev->GetMac()) {
+            NS_LOG_ERROR("AP device " << i << " is invalid");
+        } else {
+            NS_LOG_INFO("AP " << i << " has valid MAC");
+        }
+    }
     
-    // Configure STAs with roaming support
-    mac.SetType("ns3::StaWifiMac",
-                "Ssid", SsidValue(ssid1),
-                "ActiveProbing", BooleanValue(true));
-    NetDeviceContainer staDevicesA = wifi.Install(phy, mac, wifiStaNodesA);
-    
-    mac.SetType("ns3::StaWifiMac",
-                "Ssid", SsidValue(ssid2),
-                "ActiveProbing", BooleanValue(true));
-    NetDeviceContainer staDevicesB = wifi.Install(phy, mac, wifiStaNodesB);
-    
-    // Mobility model
+    for (uint32_t i = 0; i < staDevices.GetN(); i++) {
+        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(staDevices.Get(i));
+        if (!dev || !dev->GetMac()) {
+            NS_LOG_ERROR("STA device " << i << " is invalid");
+        }
+    }
+
+    // 移動模型
     MobilityHelper mobility;
-    
-    // Position of APs
-    Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-    positionAlloc->Add(Vector(-50.0, 0.0, 0.0));  // AP A
-    positionAlloc->Add(Vector(50.0, 0.0, 0.0));   // AP B
-    
-    mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    mobility.Install(wifiApNodes);
-    
-    // Initial positions for STAs with controlled mobility
-    mobility.SetPositionAllocator("ns3::RandomDiscPositionAllocator",
-                                "X", DoubleValue(-50.0),
-                                "Y", DoubleValue(0.0),
-                                "Rho", StringValue("ns3::UniformRandomVariable[Min=0|Max=10]"));
-    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
-    mobility.Install(wifiStaNodesA);
-    
-    mobility.SetPositionAllocator("ns3::RandomDiscPositionAllocator",
-                                "X", DoubleValue(50.0),
-                                "Y", DoubleValue(0.0),
-                                "Rho", StringValue("ns3::UniformRandomVariable[Min=0|Max=10]"));
-    mobility.Install(wifiStaNodesB);
-    
-    // Internet stack
+    mobility.Install(apNodes);
+
+    mobility.SetMobilityModel("ns3::RandomWalk2dMobilityModel",
+                             "Bounds", RectangleValue(Rectangle(-50, 50, -50, 50)));
+    mobility.Install(staNodes);
+
+    // 網路協定堆疊
     InternetStackHelper stack;
-    stack.Install(wifiApNodes);
-    stack.Install(wifiStaNodesA);
-    stack.Install(wifiStaNodesB);
-    
-    // Assign IP addresses
+    stack.Install(apNodes);
+    stack.Install(staNodes);
+
+    // IP位址分配
     Ipv4AddressHelper address;
     address.SetBase("10.1.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer apInterfaceA = address.Assign(apDevicesA);
-    Ipv4InterfaceContainer staInterfacesA = address.Assign(staDevicesA);
-    
-    address.SetBase("10.1.2.0", "255.255.255.0");
-    Ipv4InterfaceContainer apInterfaceB = address.Assign(apDevicesB);
-    Ipv4InterfaceContainer staInterfacesB = address.Assign(staDevicesB);
-    
-    // Traffic generation
-    uint16_t port = 9;
-    ApplicationContainer serverApps;
-    
-    UdpServerHelper serverA(port);
-    serverApps.Add(serverA.Install(wifiApNodes.Get(0)));
-    UdpServerHelper serverB(port);
-    serverApps.Add(serverB.Install(wifiApNodes.Get(1)));
-    serverApps.Start(Seconds(1.0));
-    serverApps.Stop(Seconds(20.0));  // Changed to 20s total simulation time
-    
-    ApplicationContainer clientApps;
-    
-    // Configure UDP clients with higher data rate
-    UdpClientHelper clientA(apInterfaceA.GetAddress(0), port);
-    clientA.SetAttribute("MaxPackets", UintegerValue(4294967295u));
-    clientA.SetAttribute("Interval", TimeValue(Seconds(0.01)));
-    clientA.SetAttribute("PacketSize", UintegerValue(1400));
-    
-    UdpClientHelper clientB(apInterfaceB.GetAddress(0), port);
-    clientB.SetAttribute("MaxPackets", UintegerValue(4294967295u));
-    clientB.SetAttribute("Interval", TimeValue(Seconds(0.01)));
-    clientB.SetAttribute("PacketSize", UintegerValue(1400));
-    
-    // Install clients
-    for (uint32_t i = 0; i < wifiStaNodesA.GetN(); ++i) {
-        clientApps.Add(clientA.Install(wifiStaNodesA.Get(i)));
+    Ipv4InterfaceContainer apInterfaces = address.Assign(apDevices);
+    Ipv4InterfaceContainer staInterfaces = address.Assign(staDevices);
+
+    // 流量設定（Full-Queue Model）
+    ApplicationContainer apps;
+    for (uint32_t i = 0; i < staNodes.GetN(); ++i) {
+        OnOffHelper onoff("ns3::UdpSocketFactory", 
+                         InetSocketAddress(apInterfaces.GetAddress(i % nAp), 9));
+        onoff.SetConstantRate(DataRate("1Mbps"), 1024);
+        apps.Add(onoff.Install(staNodes.Get(i)));
     }
-    for (uint32_t i = 0; i < wifiStaNodesB.GetN(); ++i) {
-        clientApps.Add(clientB.Install(wifiStaNodesB.Get(i)));
-    }
+    apps.Start(Seconds(0.0));
+    apps.Stop(Seconds(totalTime));
+
+    // 流量監控
+    FlowMonitorHelper flowMonitor;
+    Ptr<FlowMonitor> monitor = flowMonitor.InstallAll();
+
+    // 初始化數據文件
+    std::ofstream outFile("throughput.csv");
+    outFile << "Time,Total_Throughput_Mbps\n";
     
-    clientApps.Start(Seconds(2.0));
-    clientApps.Stop(Seconds(20.0));  // Changed to 20s total simulation time
-    
-    // Flow monitor
-    FlowMonitorHelper flowmon;
-    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
-    
-    // Schedule throughput monitoring
-    Simulator::Schedule(Seconds(1.0), &ThroughputMonitor, &flowmon, monitor,
-                       std::ref(wifiStaNodesA), std::ref(wifiStaNodesB),
-                       wifiApNodes.Get(0), wifiApNodes.Get(1), 1.0);
-    
-    // Schedule user movements with precise timing and improved movement
-    Simulator::Schedule(Seconds(10.0), [&wifiStaNodesA, &wifiStaNodesB]() {
-        NS_LOG_INFO("Executing first movement at t=10s");
-        // Move 25% from A to B (4 users)
-        for (uint32_t i = 0; i < 4; ++i) {
-            Vector targetPos(50.0 + (rand() % 5), (rand() % 10) - 5, 0);
-            MoveNode(wifiStaNodesA.Get(i), targetPos);
-            // Stop previous nodes
-            Ptr<ConstantVelocityMobilityModel> mobility = 
-                wifiStaNodesA.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-            Simulator::Schedule(Seconds(2.0), &ConstantVelocityMobilityModel::SetVelocity,
-                              mobility, Vector(0, 0, 0));
-        }
-        // Move 50% from B to A (8 users)
-        for (uint32_t i = 0; i < 8; ++i) {
-            Vector targetPos(-50.0 + (rand() % 5), (rand() % 10) - 5, 0);
-            MoveNode(wifiStaNodesB.Get(i), targetPos);
-            // Stop nodes after movement
-            Ptr<ConstantVelocityMobilityModel> mobility = 
-                wifiStaNodesB.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-            Simulator::Schedule(Seconds(2.0), &ConstantVelocityMobilityModel::SetVelocity,
-                              mobility, Vector(0, 0, 0));
-        }
-    });
-    
-    Simulator::Schedule(Seconds(15.0), [&wifiStaNodesA, &wifiStaNodesB]() {
-        NS_LOG_INFO("Executing second movement at t=15s");
-        // Move 50% from A to B (10 users)
-        for (uint32_t i = 0; i < 10; ++i) {
-            Vector targetPos(50.0 + (rand() % 5), (rand() % 10) - 5, 0);
-            MoveNode(wifiStaNodesA.Get(i), targetPos);
-            // Stop nodes after movement
-            Ptr<ConstantVelocityMobilityModel> mobility = 
-                wifiStaNodesA.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-            Simulator::Schedule(Seconds(2.0), &ConstantVelocityMobilityModel::SetVelocity,
-                              mobility, Vector(0, 0, 0));
-        }
-        // Move 50% from B to A (6 users)
-        for (uint32_t i = 0; i < 6; ++i) {
-            Vector targetPos(-50.0 + (rand() % 5), (rand() % 10) - 5, 0);
-            MoveNode(wifiStaNodesB.Get(i), targetPos);
-            // Stop nodes after movement
-            Ptr<ConstantVelocityMobilityModel> mobility = 
-                wifiStaNodesB.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-            Simulator::Schedule(Seconds(2.0), &ConstantVelocityMobilityModel::SetVelocity,
-                              mobility, Vector(0, 0, 0));
-        }
-    });
-    
-    // Animation
-    AnimationInterface anim("wifi-handover-simulation.xml");
-    
-    // Set node colors and descriptions
-    for (uint32_t i = 0; i < wifiApNodes.GetN(); ++i) {
-        anim.UpdateNodeDescription(wifiApNodes.Get(i), "AP");
-        anim.UpdateNodeColor(wifiApNodes.Get(i), 255, 0, 0); // Red for APs
-    }
-    
-    for (uint32_t i = 0; i < wifiStaNodesA.GetN(); ++i) {
-        anim.UpdateNodeDescription(wifiStaNodesA.Get(i), "STA-A");
-        anim.UpdateNodeColor(wifiStaNodesA.Get(i), 0, 255, 0); // Green for group A
-    }
-    
-    for (uint32_t i = 0; i < wifiStaNodesB.GetN(); ++i) {
-        anim.UpdateNodeDescription(wifiStaNodesB.Get(i), "STA-B");
-        anim.UpdateNodeColor(wifiStaNodesB.Get(i), 0, 0, 255); // Blue for group B
-    }
-    
-    anim.EnablePacketMetadata(true);
-    
-    Simulator::Stop(Seconds(20.0));  // Changed to 20s total simulation time
+    std::ofstream userFile("user_distribution.csv");
+    userFile << "Time,NodeA_Users,NodeB_Users\n";
+    userFile << "0,16,16\n"; // 初始狀態
+
+    // 移動事件設定
+    UserMigrationHandler migrationHandler(apNodes, staNodes, apDevices, staDevices, nStaPerAp);
+    migrationHandler.MigrateUsers(5, 0.25, 0.50);  // 5秒時，AP1->AP2 25%, AP2->AP1 50%
+    migrationHandler.MigrateUsers(10, 0.50, 0.50); // 10秒時，AP1->AP2 50%, AP2->AP1 50%
+
+    // 啟動吞吐量監控 - Add error handling
+    Simulator::Schedule(Seconds(0.1), &ThroughputMonitor, monitor, std::ref(outFile));
+
+    // 模擬執行
+    NS_LOG_INFO("Starting simulation for " << totalTime << " seconds");
+    Simulator::Stop(Seconds(totalTime));
     Simulator::Run();
+
+    // 輸出結果
+    NS_LOG_INFO("Simulation completed");
+    monitor->CheckForLostPackets();
     Simulator::Destroy();
-    
     return 0;
 }
